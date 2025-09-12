@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: ec7736b611bd84e5cb61da975beabda1
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - pathLineRenderer: {instanceID: 0}
+  - futurePathRenderer: {instanceID: 0}
+  - droneTransform: {instanceID: 0}
+  - searchAgent: {instanceID: 0}
+  - navMeshAgent: {instanceID: 0}
+  - pathMaterial: {instanceID: 0}
+  - futurePathMaterial: {instanceID: 0}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
