@@ -1,3 +1,4 @@
+// PeopleSpawnerV2.cs
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.AI;
@@ -14,21 +15,12 @@ public class PeopleSpawnerV2 : MonoBehaviour
     public Vector3 center = Vector3.zero;
     public float radius = 25f;
 
-    [Header("Escalado de radio con distancia al GPS (opcional)")]
-    public bool scaleRadiusByDistanceToTarget = false;
-    public float radiusPerMeter = 0.1f;
-    public float minRadius = 5f;
-    public float maxRadius = 60f;
-
     [Header("Ajuste al terreno / NavMesh")]
     public bool projectToNavMesh = true;
     public float navSampleMaxDistance = 3f;
-
     public bool alignToGround = true;
     public LayerMask groundMask;
     public float groundRayHeight = 50f;
-
-    [Tooltip("Levanta un poquito el objeto sobre el suelo (m).")]
     public float extraGroundClearance = 0.0f;
 
     [Header("Descriptores (opcional)")]
@@ -36,8 +28,11 @@ public class PeopleSpawnerV2 : MonoBehaviour
     public PersonDescriptor[] inlinePool;
 
     [Header("Forzar objetivo del agente")]
+    [Tooltip("Incluye SIEMPRE una persona que coincide con el targetDescriptor del SearchAgent.")]
     public bool forceIncludeAgentTarget = true;
     [Range(0f, 1f)] public float includeTargetProbability = 1f;
+
+    [Tooltip("SearchAgent del dron que buscará (para pasarle el designado).")]
     public SearchAgent searchAgent;
     public bool alsoSetAgentCurrentTarget = false;
 
@@ -46,44 +41,51 @@ public class PeopleSpawnerV2 : MonoBehaviour
     void Start()
     {
         runtimeCenter = ComputeCenter();
-        float finalRadius = ComputeRadius(runtimeCenter);
 
         var unique = BuildUniqueCandidates();
         Shuffle(unique);
 
         int toSpawn = Mathf.Min(count, Mathf.Max(1, unique.Count));
         if (count > unique.Count)
-            Debug.LogWarning($"[PeopleSpawnerV2] Pediste {count}, pero solo hay {unique.Count} combinaciones únicas. Se generan {toSpawn}.");
+            Debug.LogWarning($"[PeopleSpawnerV2] Pediste {count}, pero solo hay {unique.Count}. Se generan {toSpawn}.");
 
         bool willIncludeTarget = forceIncludeAgentTarget && searchAgent != null && Random.value <= includeTargetProbability;
         int forcedIndex = willIncludeTarget ? Random.Range(0, toSpawn) : -1;
 
         for (int i = 0; i < toSpawn; i++)
         {
-            // Descriptor
+            // Descriptor elegido
             PersonDescriptor desc = (i == forcedIndex && searchAgent != null)
                 ? searchAgent.targetDescriptor
                 : unique[i % unique.Count];
 
-            // Posición XZ
-            Vector2 v = Random.insideUnitCircle * finalRadius;
+            // Posición tentativa
+            Vector2 v = Random.insideUnitCircle * radius;
             Vector3 pos = new Vector3(runtimeCenter.x + v.x, runtimeCenter.y, runtimeCenter.z + v.y);
 
-            // Opcional: ajustar a NavMesh
-            if (projectToNavMesh && NavMesh.SamplePosition(pos, out NavMeshHit nh, navSampleMaxDistance, NavMesh.AllAreas))
-                pos = nh.position;
+            // Proyección al NavMesh
+            if (projectToNavMesh)
+            {
+                if (!NavMesh.SamplePosition(pos, out NavMeshHit nh, navSampleMaxDistance, NavMesh.AllAreas))
+                {
+                    // Fallback amplio
+                    if (NavMesh.SamplePosition(pos, out nh, 1000f, NavMesh.AllAreas))
+                        pos = nh.position;
+                }
+                else pos = nh.position;
+            }
 
             // Instanciar
             var go = Instantiate(personPrefab, pos, Quaternion.identity);
 
-            // Alinear a suelo: coloca la BASE del collider/render justo en el suelo
-            if (alignToGround)
-                SnapBottomToGround(go);
+            // Añadir ClaimableTarget (para que pueda reservarse)
+            if (!go.TryGetComponent<ClaimableTarget>(out _))
+                go.AddComponent<ClaimableTarget>();
 
-            // (Opcional) Forzar capa "Person" si la usas en personMask
-            // go.layer = LayerMask.NameToLayer("Person");
+            // Alinear a suelo
+            if (alignToGround) SnapBottomToGround(go);
 
-            // PersonProfile
+            // Configurar perfil
             var p = go.GetComponent<PersonProfile>();
             if (!p) p = go.AddComponent<PersonProfile>();
             p.hasJacket    = desc.requireJacket;
@@ -93,48 +95,20 @@ public class PeopleSpawnerV2 : MonoBehaviour
             p.hasBackpack  = desc.requireBackpackSpecified ? desc.hasBackpack : (Random.value > 0.5f);
             p.publicDescription = db ? db.ToHumanText(desc) : desc.ToString();
 
+            // Marcar el objetivo forzado y pasarlo al agente
             if (i == forcedIndex)
             {
                 go.name = "TARGET_" + go.name;
-                if (alsoSetAgentCurrentTarget && searchAgent != null)
-                    searchAgent.currentTarget = go.transform;
+                if (searchAgent != null)
+                {
+                    searchAgent.designatedTarget = go.transform; // clave
+                    if (alsoSetAgentCurrentTarget)
+                        searchAgent.currentTarget = go.transform;
+                }
             }
         }
 
-        Debug.Log($"[PeopleSpawnerV2] Spawn center={runtimeCenter} radius={finalRadius:F1} (count={toSpawn})");
-    }
-
-    // === Alinear base del objeto al suelo ===
-    void SnapBottomToGround(GameObject go)
-    {
-        var t = go.transform;
-        Vector3 pos = t.position;
-
-        // Raycast al suelo en la XZ del objeto
-        Vector3 from = pos + Vector3.up * groundRayHeight;
-        if (!Physics.Raycast(from, Vector3.down, out RaycastHit gh, groundRayHeight * 2f, groundMask, QueryTriggerInteraction.Ignore))
-            return; // no hay suelo bajo ese punto
-
-        // Calcula offset pivot→base usando bounds en mundo del collider (o renderer si no hay collider)
-        float pivotToBottom = 0f;
-
-        Collider col = go.GetComponentInChildren<Collider>();
-        if (col != null)
-        {
-            // bounds.min.y es la base del collider en mundo
-            pivotToBottom = pos.y - col.bounds.min.y;
-        }
-        else
-        {
-            Renderer r = go.GetComponentInChildren<Renderer>();
-            if (r != null)
-                pivotToBottom = pos.y - r.bounds.min.y;
-            else
-                pivotToBottom = 0f; // fallback si no hay nada (no mover en Y)
-        }
-
-        float newY = gh.point.y + pivotToBottom + extraGroundClearance;
-        t.position = new Vector3(pos.x, newY, pos.z);
+        Debug.Log($"[PeopleSpawnerV2] Spawn center={runtimeCenter} r={radius:F1} (count={toSpawn})");
     }
 
     Vector3 ComputeCenter()
@@ -142,25 +116,38 @@ public class PeopleSpawnerV2 : MonoBehaviour
         if (centerFromGPSTarget && searchAgent != null)
         {
             var gps = searchAgent.gpsTarget;
-            return new Vector3(gps.x, center.y, gps.z) + centerOffset;
+            var c = new Vector3(gps.x, center.y, gps.z) + centerOffset;
+
+            // Asegurar centro sobre NavMesh si se desea
+            if (projectToNavMesh && NavMesh.SamplePosition(c, out var hitCenter, 1000f, NavMesh.AllAreas))
+                c = hitCenter.position;
+
+            return c;
         }
-        else
-        {
-            return center + centerOffset;
-        }
+        return center + centerOffset;
     }
 
-    float ComputeRadius(Vector3 spawnCenter)
+    void SnapBottomToGround(GameObject go)
     {
-        if (!scaleRadiusByDistanceToTarget || searchAgent == null)
-            return radius;
+        var t = go.transform;
+        Vector3 pos = t.position;
 
-        Vector2 ag = new Vector2(searchAgent.transform.position.x, searchAgent.transform.position.z);
-        Vector2 gp = new Vector2(searchAgent.gpsTarget.x, searchAgent.gpsTarget.z);
-        float d = Vector2.Distance(ag, gp);
+        Vector3 from = pos + Vector3.up * groundRayHeight;
+        if (!Physics.Raycast(from, Vector3.down, out RaycastHit gh, groundRayHeight * 2f, groundMask, QueryTriggerInteraction.Ignore))
+            return;
 
-        float r = radius + d * radiusPerMeter;
-        return Mathf.Clamp(r, minRadius, maxRadius);
+        float pivotToBottom = 0f;
+
+        Collider col = go.GetComponentInChildren<Collider>();
+        if (col != null) pivotToBottom = pos.y - col.bounds.min.y;
+        else
+        {
+            Renderer r = go.GetComponentInChildren<Renderer>();
+            if (r != null) pivotToBottom = pos.y - r.bounds.min.y;
+        }
+
+        float newY = gh.point.y + pivotToBottom + extraGroundClearance;
+        t.position = new Vector3(pos.x, newY, pos.z);
     }
 
     List<PersonDescriptor> BuildUniqueCandidates()

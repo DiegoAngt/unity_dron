@@ -1,3 +1,4 @@
+// SearchAgent.cs
 using System;
 using System.Collections;
 using UnityEngine;
@@ -38,9 +39,7 @@ public class SearchAgent : MonoBehaviour
     public float landingClearance = 0.02f;
 
     [Header("Ajuste fino de aterrizaje")]
-    [Tooltip("Baja un poco más el dron al finalizar el descenso (en metros).")]
-    [Range(0f, 0.03f)]
-    public float landingExtraDrop = 0.005f;
+    [Range(0f, 0.03f)] public float landingExtraDrop = 0.005f;
 
     [Header("Navegación GPS Larga Distancia")]
     public bool useLongDistanceNavigation = true;
@@ -48,7 +47,7 @@ public class SearchAgent : MonoBehaviour
 
     [Header("Debug")]
     public bool debugFSM = true;
-    public float fsmUpdateFrequency = 0.1f; // Realtime
+    public float fsmUpdateFrequency = 0.1f;
 
     public LineRenderer pathLineRenderer;
     public ParticleSystem landingParticles;
@@ -57,37 +56,33 @@ public class SearchAgent : MonoBehaviour
     public PathVisualizer pathVisualizer;
     public bool enablePathRecording = true;
 
-    [Header("Finalización/Salida")]
-    [Tooltip("Al terminar (Done/Abort), detener el Play Mode del Editor.")]
-    public bool stopEditorOnFinish = true;
+    [Header("Objetivo designado (opcional)")]
+    [Tooltip("Si el spawner lo asigna, este agente intentará perseguir exactamente ese Transform.")]
+    public Transform designatedTarget;
+    public bool alwaysChaseDesignated = true;
 
-    [Tooltip("Al terminar (Done/Abort) en build, cerrar la app.")]
+    [Header("Finalización/Salida")]
+    public bool stopEditorOnFinish = true;
     public bool quitAppOnFinish = false;
 
     [Header("Estado (solo lectura)")]
     [SerializeField] private AgentPhase _phase = AgentPhase.GoingToGPS;
     public Transform currentTarget;
 
-    // Evento para notificar cambios de fase
     public event Action<AgentPhase> OnMissionPhaseChange;
 
-    // Propiedad de fase con notificación
     public AgentPhase phase
     {
-        get { return _phase; }
-        set
-        {
-            if (_phase != value)
-            {
-                _phase = value;
-                OnMissionPhaseChange?.Invoke(value);
-            }
-        }
+        get => _phase;
+        set { if (_phase != value) { _phase = value; OnMissionPhaseChange?.Invoke(value); } }
     }
 
     private NavMeshAgent agent;
     private Vector3 localSearchCenter;
     private float lastWaypointTime;
+
+    // ===== RESERVA (CLAIM) =====
+    private ClaimableTarget currentClaim;
 
     void Awake()
     {
@@ -103,27 +98,20 @@ public class SearchAgent : MonoBehaviour
 
     void Start()
     {
-        // Inicializar visualización de trayectoria
         InitializePathVisualization();
 
-        // Arrancamos SIEMPRE el monitor de debug para ver logs en consola
         phase = AgentPhase.GoingToGPS;
         StartCoroutine(FSMDebugMonitor());
 
-        // Si hay LongDistanceNavigator, delegamos la navegación; la FSM corta no arranca.
-        // (Si quieres que la detección de la FSM ocurra con LongDistanceNavigator activo, desactiva este return.)
         if (useLongDistanceNavigation && GetComponent<LongDistanceNavigator>() != null)
-        {
             return;
-        }
 
-        // Navegación corta (setup inicial)
         if (TryPlaceOnNavMesh(transform.position, 10f, out var startPos))
             agent.Warp(startPos);
         else
-            Debug.LogError("[SearchAgent] No hay NavMesh bajo el agente. Muévelo a zona azul o ajusta NavMeshSurface.");
+            Debug.LogError("[SearchAgent] No hay NavMesh bajo el agente.");
 
-        if (TryPlaceOnNavMesh(gpsTarget, 10f, out var navGps))
+        if (TryPlaceOnNavMesh(gpsTarget, 1000f, out var navGps))
             gpsTarget = navGps;
 
         agent.enabled = true;
@@ -140,7 +128,6 @@ public class SearchAgent : MonoBehaviour
             pathVisualizer.droneTransform = transform;
             pathVisualizer.searchAgent = this;
 
-            // Línea simple hacia el target (opcional, visual)
             if (pathLineRenderer == null)
             {
                 GameObject lineRendererGO = new GameObject("PathLineRenderer");
@@ -163,23 +150,17 @@ public class SearchAgent : MonoBehaviour
             if (debugFSM)
             {
                 Debug.Log($"[FSM] Fase: {phase} | Pos: {transform.position} | TieneTarget: {currentTarget != null}");
-
                 if (currentTarget != null)
                 {
                     float distance = Vector3.Distance(transform.position, currentTarget.position);
                     Debug.Log($"[FSM] Distancia al target: {distance:F1} m");
                 }
-
                 if (agent != null && agent.isActiveAndEnabled)
                 {
-                    if (agent.hasPath)
-                        Debug.Log($"[NAV] Destino: {agent.destination} | Restante: {agent.remainingDistance:F1} m");
-                    else if (!agent.pathPending)
-                        Debug.Log("[NAV] Sin path activo.");
+                    if (agent.hasPath) Debug.Log($"[NAV] Destino: {agent.destination} | Restante: {agent.remainingDistance:F1} m");
+                    else if (!agent.pathPending) Debug.Log("[NAV] Sin path activo.");
                 }
             }
-
-            // Realtime para que loggee aunque Time.timeScale = 0
             yield return new WaitForSecondsRealtime(fsmUpdateFrequency);
         }
     }
@@ -191,27 +172,18 @@ public class SearchAgent : MonoBehaviour
             switch (phase)
             {
                 case AgentPhase.GoingToGPS:
-                    yield return StartCoroutine(GoingToGPSPhase());
-                    break;
-
+                    yield return StartCoroutine(GoingToGPSPhase()); break;
                 case AgentPhase.Searching:
-                    yield return StartCoroutine(SearchingPhase());
-                    break;
-
+                    yield return StartCoroutine(SearchingPhase()); break;
                 case AgentPhase.Approaching:
-                    yield return StartCoroutine(ApproachingPhase());
-                    break;
-
+                    yield return StartCoroutine(ApproachingPhase()); break;
                 case AgentPhase.Landing:
-                    yield return StartCoroutine(LandingPhase());
-                    break;
-
+                    yield return StartCoroutine(LandingPhase()); break;
                 case AgentPhase.Done:
                     Debug.Log("[FSM] Misión completada con éxito!");
                     OnMissionComplete(true);
                     EndSimulationIfNeeded();
                     yield break;
-
                 case AgentPhase.Abort:
                     Debug.Log("[FSM] Misión abortada.");
                     OnMissionComplete(false);
@@ -229,21 +201,15 @@ public class SearchAgent : MonoBehaviour
             float pathLength = pathVisualizer.GetPathLength();
             Debug.Log($"[MISIÓN] Distancia total recorrida: {pathLength:F1} m");
         }
+        ReleaseClaim(); // liberar reserva
     }
 
     void EndSimulationIfNeeded()
     {
-        if (stopEditorOnFinish)
-        {
-            #if UNITY_EDITOR
-            UnityEditor.EditorApplication.isPlaying = false;
-            #endif
-        }
-
-        if (quitAppOnFinish)
-        {
-            Application.Quit();
-        }
+#if UNITY_EDITOR
+        if (stopEditorOnFinish) UnityEditor.EditorApplication.isPlaying = false;
+#endif
+        if (quitAppOnFinish) Application.Quit();
     }
 
     IEnumerator GoingToGPSPhase()
@@ -257,20 +223,16 @@ public class SearchAgent : MonoBehaviour
             if (Time.time - startTime > timeout)
             {
                 Debug.LogWarning("[FSM] Timeout en GoingToGPS. Forzando búsqueda.");
-                phase = AgentPhase.Searching;
-                yield break;
+                phase = AgentPhase.Searching; yield break;
             }
 
             if (!agent.enabled || !agent.isOnNavMesh)
             {
-                if (TryPlaceOnNavMesh(transform.position, 10f, out var p))
-                    agent.Warp(p);
-                yield return null;
-                continue;
+                if (TryPlaceOnNavMesh(transform.position, 10f, out var p)) agent.Warp(p);
+                yield return null; continue;
             }
 
-            if (!agent.hasPath && !agent.pathPending)
-                agent.SetDestination(gpsTarget);
+            if (!agent.hasPath && !agent.pathPending) agent.SetDestination(gpsTarget);
 
             if (!agent.pathPending && agent.remainingDistance < 1.5f)
             {
@@ -291,24 +253,32 @@ public class SearchAgent : MonoBehaviour
 
         while (phase == AgentPhase.Searching)
         {
-            // DETECCIÓN -> NO finaliza simulación; solo log + continuar flujo normal
-            if (TrySenseBestMatch(out Transform candidate))
+            // 1) Prioridad: objetivo designado (si existe) -> intentar CLAIM
+            if (alwaysChaseDesignated && designatedTarget != null)
             {
-                currentTarget = candidate;
-
-                // Log de confirmación con la descripción del perfil
-                string desc = "(sin descripción)";
-                var prof = candidate.GetComponent<PersonProfile>();
-                if (prof != null && !string.IsNullOrEmpty(prof.publicDescription))
-                    desc = prof.publicDescription;
-
-                Debug.Log($"[FSM] ✅ Objetivo encontrado: {candidate.name} | Descripción: {desc}");
-
-                phase = AgentPhase.Approaching; // seguir con el flujo normal
-                yield break;
+                if (TryClaimAndSet(designatedTarget))
+                {
+                    var prof = designatedTarget.GetComponent<PersonProfile>();
+                    string desc = (prof != null && !string.IsNullOrEmpty(prof.publicDescription)) ? prof.publicDescription : "(sin descripción)";
+                    Debug.Log($"[FSM] 🎯 Designado reclamado por {name}: {desc}");
+                    phase = AgentPhase.Approaching; yield break;
+                }
+                // si no se pudo reclamar, otro dron ya lo tiene → seguir buscando
             }
 
-            // Patrulla de búsqueda
+            // 2) Búsqueda por coincidencia -> intentar CLAIM del candidato
+            if (TrySenseBestMatch(out Transform candidate))
+            {
+                if (TryClaimAndSet(candidate))
+                {
+                    var prof = candidate.GetComponent<PersonProfile>();
+                    string desc = (prof != null && !string.IsNullOrEmpty(prof.publicDescription)) ? prof.publicDescription : "(sin descripción)";
+                    Debug.Log($"[FSM] ✅ Coincidencia reclamada por {name}: {desc}");
+                    phase = AgentPhase.Approaching; yield break;
+                }
+            }
+
+            // 3) Patrulla
             if (!agent.pathPending && agent.remainingDistance < 0.8f)
             {
                 if (Time.time - lastWaypointTime > 3f)
@@ -320,22 +290,19 @@ public class SearchAgent : MonoBehaviour
                         lastWaypointTime = Time.time;
                         Debug.Log($"[FSM] Nuevo waypoint: {hit.position}");
                     }
-
                     if (++wp >= maxLocalWaypoints)
                     {
-                        wp = 0;
-                        localSearchCenter = transform.position;
+                        wp = 0; localSearchCenter = transform.position;
                         Debug.Log("[FSM] Reiniciando patrulla desde nueva posición.");
                     }
                 }
             }
 
-            // Timeout de búsqueda
+            // 4) Timeout de búsqueda
             if (Time.time - lastWaypointTime > 30f)
             {
                 Debug.LogWarning("[FSM] Timeout de búsqueda. Recentrando.");
-                localSearchCenter = transform.position;
-                lastWaypointTime = Time.time;
+                localSearchCenter = transform.position; lastWaypointTime = Time.time;
 
                 Vector3 p = RandomPointInDisk(localSearchCenter, searchRadius);
                 if (NavMesh.SamplePosition(p, out NavMeshHit hit, 2f, NavMesh.AllAreas))
@@ -355,8 +322,8 @@ public class SearchAgent : MonoBehaviour
         if (currentTarget == null)
         {
             Debug.LogWarning("[FSM] No hay target para aproximarse. Volviendo a buscar.");
-            phase = AgentPhase.Searching;
-            yield break;
+            ReleaseClaim();
+            phase = AgentPhase.Searching; yield break;
         }
 
         Vector3 landingXZ = SafeOffsetXZ(currentTarget.position, minLandingDistance, maxLandingDistance);
@@ -368,25 +335,26 @@ public class SearchAgent : MonoBehaviour
 
             while (phase == AgentPhase.Approaching)
             {
+                RefreshClaim(); // mantener la reserva viva
+
                 if (Time.time - startTime > timeout)
                 {
                     Debug.LogWarning("[FSM] Timeout en aproximación. Volviendo a buscar.");
-                    phase = AgentPhase.Searching;
-                    yield break;
+                    ReleaseClaim();
+                    phase = AgentPhase.Searching; yield break;
                 }
 
                 if (!agent.pathPending && agent.remainingDistance <= 0.6f)
                 {
                     phase = AgentPhase.Landing;
-                    Debug.Log("[FSM] Posición de aterrizaje alcanzada.");
-                    yield break;
+                    Debug.Log("[FSM] Posición de aterrizaje alcanzada."); yield break;
                 }
 
                 if (currentTarget == null)
                 {
                     Debug.LogWarning("[FSM] Target perdido durante aproximación.");
-                    phase = AgentPhase.Searching;
-                    yield break;
+                    ReleaseClaim();
+                    phase = AgentPhase.Searching; yield break;
                 }
 
                 yield return null;
@@ -395,6 +363,7 @@ public class SearchAgent : MonoBehaviour
         else
         {
             Debug.LogWarning("[FSM] No se encontró punto de aterrizaje válido. Volviendo a buscar.");
+            ReleaseClaim();
             phase = AgentPhase.Searching;
         }
     }
@@ -408,8 +377,8 @@ public class SearchAgent : MonoBehaviour
         if (currentTarget == null)
         {
             Debug.LogWarning("[FSM] No hay target para aterrizar.");
-            phase = AgentPhase.Searching;
-            yield break;
+            ReleaseClaim();
+            phase = AgentPhase.Searching; yield break;
         }
 
         agent.enabled = false;
@@ -434,73 +403,94 @@ public class SearchAgent : MonoBehaviour
                     agent.Warp(hit2.position);
                 agent.enabled = false;
             }
+
+            RefreshClaim(); // refrescar durante los intentos
         }
 
         agent.enabled = true;
         phase = success ? AgentPhase.Done : AgentPhase.Abort;
         Debug.Log($"[FSM] Aterrizaje {(success ? "éxito" : "fallido")}");
+
+        // La reserva se libera en OnMissionComplete()
     }
 
     bool TrySenseBestMatch(out Transform best)
     {
         best = null;
+
+        // Si hay designado y queremos usarlo siempre, devolverlo como mejor candidato
+        if (alwaysChaseDesignated && designatedTarget != null)
+        {
+            best = designatedTarget;
+            return true;
+        }
+
         Collider[] hits = Physics.OverlapSphere(transform.position, searchRadius, personMask);
-
-        Debug.Log($"[DETECCIÓN] Personas en radio ({searchRadius} m): {hits.Length}");
-
         float bestScore = -1f;
 
         foreach (var h in hits)
         {
             var profile = h.GetComponent<PersonProfile>();
-            if (!profile)
-            {
-                Debug.LogWarning($"[DETECCIÓN] Objeto en capa Person sin PersonProfile: {h.name}");
-                continue;
-            }
+            if (!profile) continue;
 
             // FOV
             Vector3 dir = (h.transform.position - transform.position);
             Vector3 dirFlat = new Vector3(dir.x, 0, dir.z);
             float angle = Vector3.Angle(transform.forward, dirFlat.normalized);
-            if (angle > fov * 0.5f)
-            {
-                Debug.Log($"[DETECCIÓN] Fuera de FOV: {angle:F1}° > {fov * 0.5f}°");
-                continue;
-            }
+            if (angle > fov * 0.5f) continue;
 
             // Línea de vista
             Vector3 eye = transform.position + Vector3.up * eyeHeight;
             Vector3 targetCenter = h.bounds.center;
             Vector3 rayDir = (targetCenter - eye).normalized;
             int losMask = obstacleMask.value & ~(1 << gameObject.layer);
-
             if (Physics.Raycast(eye, rayDir, out RaycastHit rh, searchRadius, losMask, QueryTriggerInteraction.Ignore))
             {
-                if (rh.collider.transform != h.transform)
-                {
-                    Debug.Log($"[DETECCIÓN] Obstruído por: {rh.collider.name}");
-                    continue;
-                }
+                if (rh.collider.transform != h.transform) continue;
             }
 
             float s = profile.ScoreMatch(targetDescriptor);
-            Debug.Log($"[DETECCIÓN] {h.name}: {profile.publicDescription} | Puntuación: {s:F2}/{matchThreshold}");
-
             if (s > bestScore && s >= matchThreshold)
             {
                 bestScore = s;
                 best = h.transform;
-                Debug.Log($"[DETECCIÓN] ✅ OBJETIVO ENCONTRADO: {s:F2} puntos");
             }
         }
-
-        if (best == null)
-            Debug.Log($"[DETECCIÓN] ❌ No se encontró objetivo >= umbral ({matchThreshold})");
-
         return best != null;
     }
 
+    // ==== CLAIM helpers ====
+    bool TryClaimAndSet(Transform t)
+    {
+        if (t == null) return false;
+        var c = t.GetComponent<ClaimableTarget>();
+        if (c == null)
+        {
+            // Sin sistema de claim, seguir normal
+            currentTarget = t;
+            return true;
+        }
+        if (c.TryClaim(this))
+        {
+            currentClaim = c;
+            currentTarget = t;
+            return true;
+        }
+        return false; // otro dron ya lo reclamó
+    }
+
+    void RefreshClaim()
+    {
+        if (currentClaim != null) currentClaim.Refresh(this);
+    }
+
+    void ReleaseClaim()
+    {
+        if (currentClaim != null) currentClaim.Release(this);
+        currentClaim = null;
+    }
+
+    // ==== Utilidades varias ====
     Vector3 RandomPointInDisk(Vector3 center, float r)
     {
         Vector2 v = Random.insideUnitCircle * r;
@@ -519,10 +509,10 @@ public class SearchAgent : MonoBehaviour
     {
         float targetY = Mathf.Max(transform.position.y, height);
         Debug.Log($"[ATERRIZAJE] Ascendiendo a {targetY} m");
-
         while (transform.position.y < targetY - 0.005f)
         {
             transform.position += Vector3.up * (ascendSpeed * Time.deltaTime);
+            RefreshClaim();
             yield return null;
         }
     }
@@ -531,7 +521,6 @@ public class SearchAgent : MonoBehaviour
     {
         Debug.Log("[ATERRIZAJE] Iniciando descenso...");
 
-        // 1) Ray al suelo
         if (!Physics.Raycast(dropPoint + Vector3.up * 50f, Vector3.down,
             out RaycastHit ground, 100f, groundMask, QueryTriggerInteraction.Ignore))
         {
@@ -550,11 +539,9 @@ public class SearchAgent : MonoBehaviour
             yield break;
         }
 
-        // Desactivar colisión dura mientras bajamos
         bool originalTrigger = col.isTrigger;
         col.isTrigger = true;
 
-        // Detector de persona durante el descenso
         var detector = gameObject.AddComponent<LandingCollisionDetector>();
         detector.personMask = personMask;
         detector.onPersonHit = () =>
@@ -563,21 +550,16 @@ public class SearchAgent : MonoBehaviour
             Debug.Log("[ATERRIZAJE] ⚠️ Colisión detectada durante descenso!");
         };
 
-        // Offset desde el pivot a la base del collider
         float pivotToBottom = transform.position.y - col.bounds.min.y;
-
-        // Altura objetivo: suelo + (clearance - extraDrop, clamp >= 0) + offset pivot→base
         float effectiveClearance = Mathf.Max(0f, landingClearance - landingExtraDrop);
         float targetY = ground.point.y + effectiveClearance + pivotToBottom;
 
-        Debug.Log($"[ATERRIZAJE] Descendiendo hasta Y={targetY:F3} (suelo={ground.point.y:F3}, clearance={landingClearance:F3}, extraDrop={landingExtraDrop:F3}, clearanceEf={effectiveClearance:F3}, offset={pivotToBottom:F3})");
-
-        // Descenso con tope exacto
         while (transform.position.y > targetY && !collidedWithPerson)
         {
             float step = descendSpeed * Time.deltaTime;
             float newY = Mathf.Max(transform.position.y - step, targetY);
             transform.position = new Vector3(transform.position.x, newY, transform.position.z);
+            RefreshClaim();
             yield return null;
         }
 
@@ -605,13 +587,16 @@ public class SearchAgent : MonoBehaviour
     void Update()
     {
         if (currentTarget != null)
+        {
             UpdateVisualPath();
+            RefreshClaim(); // refresco continuo por seguridad
+        }
     }
 
     void OnDestroy()
     {
-        if (pathVisualizer != null)
-            pathVisualizer.ClearPath();
+        ReleaseClaim();
+        if (pathVisualizer != null) pathVisualizer.ClearPath();
     }
 
     void OnDrawGizmosSelected()
@@ -619,7 +604,6 @@ public class SearchAgent : MonoBehaviour
         Gizmos.color = Color.yellow;
         Gizmos.DrawWireSphere(transform.position, searchRadius);
 
-        // Dibujar FOV
         Gizmos.color = Color.cyan;
         Vector3 eyePosition = transform.position + Vector3.up * eyeHeight;
         float halfFOV = fov / 2f;
